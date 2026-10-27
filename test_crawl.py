@@ -156,5 +156,6 @@ def test_no_images(self):
     actual = get_images_from_html(input_body, input_url)
     expected = []
     self.assertEqual(actual, expected)
+    
 if __name__ == "__main__":
     unittest.main()
