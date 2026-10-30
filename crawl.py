@@ -4,6 +4,8 @@ from typing import TypedDict
 
 import sys
 import requests
+import asyncio
+import aiohttp
 
 # 1. Define the global structure blueprint ahead of time
 class PageData(TypedDict):
@@ -13,9 +15,106 @@ class PageData(TypedDict):
     outgoing_links: list[str]
     image_urls: list[str]
 
+class AsyncCrawler():
+    def __init__(self, base_url, base_domain, max_concurrency=3, max_pages = 10):
+        self.base_url = base_url
+        self.base_domain = base_domain
+        self.page_data = {}
+        self.visited = set()
+        self.max_concurrency = max_concurrency
+        self.max_pages = max_pages
+        self.lock = asyncio.Lock()
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.session = None
+        self.should_stop = False
+        self.all_tasks = set()
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, exc_tb):
+        await self.session.close()
+
+    async def add_page_visit(self, normalized_url):
+        if self.should_stop:
+            return False
+        
+        async with self.lock:
+            if len(self.visited) >= self.max_pages:
+                self.should_stop = True
+                print(f"Reached maximum number of pages to crawl")
+                return False
+            if normalized_url in self.visited:
+                return False
+            self.visited.add(normalized_url)
+            return True
+
+    async def get_html(self, raw_url):
+        try:
+            async with self.session.get(raw_url) as response:
+                # Check content-type header to ensure it's html
+                content_type = response.headers.get("content-type", "")
+                if "text/html" not in content_type:
+                    raise ValueError(f"Invalid content type: {content_type}")
+
+                # Raise an error if status code is 400 or greater
+                response.raise_for_status()
+
+                # Return the HTML text string
+                return await response.text()
+        except Exception as e:
+            print(f"Unexpected error fetching {raw_url}: {e}")
+            return "" 
+
+    async def crawl_page(self, current_url):
+        # Check if should stop
+        if self.should_stop:
+            return
+        # Same domain check
+        parsed_url = urlparse(current_url)
+        if parsed_url.netloc != self.base_domain:
+            return
+
+        # Normalize URL and check if already visited
+        norm_url = normalize_url(current_url)
+        if not await self.add_page_visit(norm_url):
+            return
+
+        # Limit concurrency with semaphore
+        async with self.semaphore:
+            print(f"Crawling: {current_url}")
+            html = await self.get_html(current_url)
+            if not html:
+                return
+
+            # Extract data 
+            page_data = extract_page_data(html, self.base_url)
+            #print(f"page_data: {page_data}")
+
+        # Safely update shared page dictionary
+        async with self.lock:
+            self.page_data[norm_url] = page_data
+
+        # Recursively crawl outgoing links
+        tasks = []
+        for link in page_data.get("outgoing_links", []):
+            task = asyncio.create_task(self.crawl_page(link))
+            self.all_tasks.add(task)
+            tasks.append(task)
+
+            task.add_done_callback(self.all_tasks.discard)
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def crawl(self):
+        await self.crawl_page(self.base_url)
+        return self.page_data
+
 def normalize_url(url: str) -> str:
     url_parts = urlsplit(url)
-    #print("\nurl_parts: ", url_parts)
+
     # Remove slash at end of path if present
     return url_parts.netloc + url_parts.path.rstrip('/')
 
@@ -117,55 +216,12 @@ def extract_page_data(html: str, page_url: str):
         "image_urls": images,
     }
 
-def get_html(url: str) -> str:
-    # Fetch with the required User-Agent header
-    response = requests.get(url, headers={"User-Agent": "Bootcrawler/1.0"})
+async def crawl_site_async(base_url, max_concurrency, max_pages):
+    # Extract the domain to pass along with the URL
+    parsed_url = urlparse(base_url)
+    base_domain = parsed_url.netloc
 
-    # Raise an error if status code is 400 or greater
-    response.raise_for_status()
-
-    # Raise an error if content type is not text/html
-    content_type = response.headers.get("Content-Type", "")
-    if "text/html" not in content_type:
-        raise ValueError(f"Invalid content type: {content_type}")
-
-    # Return the HTML text string
-    return response.text
-
-def crawl_page(base_url, current_url=None, page_data=None) -> dict[str, PageData]:
-    # First call, set current_url to base_url
-    if current_url is None:
-        current_url = base_url
-
-    # Initialize the page data dictionary if doesn't exist
-    if page_data is None:
-        page_data = {}
-
-    # If not on same domain, return
-    if not are_same_domain(base_url, current_url):
-        return
-
-    # Get normalized version of current url
-    norm_current = normalize_url(current_url)
-
-    # If already crawled, return
-    if norm_current in page_data:
-        return
-
-    html = get_html(current_url)
-
-    data = extract_page_data(html, current_url)
-
-    page_data[norm_current] = data
-
-    for link in data["outgoing_links"]:
-        # Recursively crawl each link
-        crawl_page(base_url, current_url=link, page_data=page_data)
-
-    return page_data
-
-def are_same_domain(base_url: str, current_url: str) -> bool:
-    base_parsed = urlparse(base_url)
-    current_parsed = urlparse(current_url)
-
-    return base_parsed.netloc == current_parsed.netloc
+    # This automatically triggers __aenter__(session opens) and __aexit__(session closes)
+    async with AsyncCrawler(base_url, base_domain, max_concurrency, max_pages) as crawler:
+        page_data = await crawler.crawl()
+        return page_data
